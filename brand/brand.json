@@ -2,5 +2,8 @@
   "name": "KingDesk",
   "bundle_id": "com.kingdesk.app",
   "description": "KingDesk Remote Desktop",
-  "company": "KingDesk"
+  "company": "KingDesk",
+  "default_settings": {
+    "approve-mode": "click"
+  }
 }

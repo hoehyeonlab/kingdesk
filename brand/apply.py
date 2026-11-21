@@ -27,6 +27,15 @@ LOWER = NAME.lower()
 BUNDLE_ID = BRAND["bundle_id"]
 DESCRIPTION = BRAND["description"]
 COMPANY = BRAND["company"]
+# Option defaults the user can still change in Settings (same mechanism as upstream's
+# custom-client "default-settings").
+DEFAULT_SETTINGS = BRAND.get("default_settings", {})
+
+
+def rust_string_map(d):
+    items = ", ".join(f"({json.dumps(k)}.to_owned(), {json.dumps(v)}.to_owned())" for k, v in d.items())
+    return f"RwLock::new(HashMap::from([{items}]))"
+
 
 # (file, old, new, expected occurrences)
 EDITS = [
@@ -88,6 +97,12 @@ EDITS = [
      "                _svcIsUsingPublicServer.value),",
      "            offstage: true,", 1),
 ]
+
+if DEFAULT_SETTINGS:
+    EDITS.append((
+        "libs/hbb_common/src/config.rs",
+        "pub static ref DEFAULT_SETTINGS: RwLock<HashMap<String, String>> = Default::default();",
+        f"pub static ref DEFAULT_SETTINGS: RwLock<HashMap<String, String>> = {rust_string_map(DEFAULT_SETTINGS)};", 1))
 
 # brand/icons/<src> -> destinations in the tree
 ICONS = {
