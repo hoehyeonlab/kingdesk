@@ -1,0 +1,410 @@
+name: KingDesk build
+
+# Windows x64 and macOS (arm64, x86_64) installers of the branded client.
+# The jobs are the matching ones of upstream's flutter-build.yml, with the brand applied
+# after checkout (brand/apply.py) and without upstream's signing, MSI and update-metadata steps.
+# When rebasing onto a newer upstream tag, diff that file between the two tags and carry
+# the relevant changes over (toolchain versions in `env` included).
+
+on:
+  workflow_dispatch:
+    inputs:
+      release-tag:
+        description: "Release tag the installers are published under"
+        type: string
+        default: "kingdesk-1.5.3"
+
+permissions:
+  contents: write
+
+env:
+  SCITER_RUST_VERSION: "1.75" # https://github.com/rustdesk/rustdesk/discussions/7503, also 1.78 has ABI change which causes our sciter version not working, https://blog.rust-lang.org/2024/03/30/i128-layout-update.html
+  MAC_RUST_VERSION: "1.81" # 1.81 is requred for macos, because of https://github.com/yury/cidre requires 1.81
+  LLVM_VERSION: "15.0.6"
+  FLUTTER_VERSION: "3.24.5"
+  # macOS arm64 only: 3.24.5's engine crashes in attributedSubstringForProposedRange
+  # (https://github.com/rustdesk/rustdesk/issues/16817, https://github.com/flutter/flutter/issues/153157).
+  # x86_64 stays on FLUTTER_VERSION: 3.44's FlutterMacOS needs macOS 10.15 there, and it targets 10.14.
+  FLUTTER_MACOS_ARM_VERSION: "3.44.9"
+  VCPKG_BINARY_SOURCES: "clear;x-gha,readwrite"
+  # vcpkg version: 2026.07.29
+  VCPKG_COMMIT_ID: "9e593bb18ea69cc5095e012465dcd675a822ed0d"
+  VERSION: "1.5.3"
+  TAG_NAME: "${{ inputs.release-tag }}"
+
+jobs:
+  generate-bridge:
+    uses: ./.github/workflows/bridge.yml
+
+  build-RustDeskTempTopMostWindow:
+    uses: ./.github/workflows/third-party-RustDeskTempTopMostWindow.yml
+    with:
+      upload-artifact: true
+      target: windows-2022
+      configuration: Release
+      platform: x64
+      target_version: Windows10
+
+  build-for-windows:
+    name: x86_64-pc-windows-msvc
+    needs: [build-RustDeskTempTopMostWindow, generate-bridge]
+    runs-on: windows-2022
+    env:
+      TARGET: x86_64-pc-windows-msvc
+      ARCH: x86_64
+      VCPKG_TRIPLET: x64-windows-static
+    steps:
+      - name: Export GitHub Actions cache environment variables
+        uses: actions/github-script@d7906e4ad0b1822421a7e6a35d5ca353c962f410 # v6
+        with:
+          script: |
+            core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
+            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
+
+      - name: Checkout source code
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          submodules: recursive
+
+      - name: Apply brand
+        shell: bash
+        run: python3 brand/apply.py
+
+      - name: Restore bridge files
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: bridge-artifact
+          path: ./
+
+      - name: Install LLVM and Clang
+        uses: KyleMayes/install-llvm-action@ebc0426251bc40c7cd31162802432c68818ab8f0 # v2.0.9
+        with:
+          version: ${{ env.LLVM_VERSION }}
+
+      - name: Install flutter
+        uses: subosito/flutter-action@2783a3f08e1baf891508463f8c6653c258246225  # v2.12.0; https://github.com/subosito/flutter-action/issues/277
+        with:
+          channel: "stable"
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          architecture: x64
+
+      # https://github.com/flutter/flutter/issues/155685
+      - name: Replace engine with rustdesk custom flutter engine
+        run: |
+          flutter doctor -v
+          flutter precache --windows
+          Invoke-WebRequest -Uri https://github.com/rustdesk/engine/releases/download/main/windows-x64-release.zip -OutFile windows-x64-release.zip
+          Expand-Archive -Path windows-x64-release.zip -DestinationPath windows-x64-release
+          mv -Force windows-x64-release/*  C:/hostedtoolcache/windows/flutter/stable-${{ env.FLUTTER_VERSION }}-x64/bin/cache/artifacts/engine/windows-x64-release/
+
+      - name: Patch flutter
+        shell: bash
+        run: |
+          cp .github/patches/flutter_3.24.4_dropdown_menu_enableFilter.diff $(dirname $(dirname $(which flutter)))
+          cd $(dirname $(dirname $(which flutter)))
+          if [[ "3.24.5" == ${{env.FLUTTER_VERSION}} ]]; then
+            git apply flutter_3.24.4_dropdown_menu_enableFilter.diff
+          fi
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: ${{ env.SCITER_RUST_VERSION }}
+          targets: ${{ env.TARGET }}
+          components: "rustfmt"
+
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          prefix-key: windows-2022
+
+      - name: Setup vcpkg with Github Actions binary cache
+        uses: lukka/run-vcpkg@b1a0dd252f06b9e25b3c022a9a03bd7a427fb6a2 # v11
+        with:
+          vcpkgDirectory: C:\vcpkg
+          vcpkgGitCommitId: ${{ env.VCPKG_COMMIT_ID }}
+          doNotCache: false
+
+      - name: Install vcpkg dependencies
+        env:
+          VCPKG_DEFAULT_HOST_TRIPLET: ${{ env.VCPKG_TRIPLET }}
+        run: |
+          if ! $VCPKG_ROOT/vcpkg \
+            install \
+            --triplet ${{ env.VCPKG_TRIPLET }} \
+            --x-install-root="$VCPKG_ROOT/installed"; then
+            find "${VCPKG_ROOT}/" -name "*.log" | while read -r _1; do
+              echo "$_1:"
+              echo "======"
+              cat "$_1"
+              echo "======"
+              echo ""
+            done
+            exit 1
+          fi
+          head -n 100 "${VCPKG_ROOT}/buildtrees/ffmpeg/build-${{ env.VCPKG_TRIPLET }}-rel-out.log" || true
+        shell: bash
+
+      - name: Build rustdesk
+        run: |
+          python3 .\build.py --portable --flutter --skip-portable-pack --hwcodec --vram
+          mv ./flutter/build/windows/x64/runner/Release ./rustdesk
+
+          # Download usbmmidd_v2.zip and extract it to ./rustdesk
+          Invoke-WebRequest -Uri https://github.com/rustdesk-org/rdev/releases/download/usbmmidd_v2/usbmmidd_v2.zip -OutFile usbmmidd_v2.zip
+          Expand-Archive usbmmidd_v2.zip -DestinationPath .
+          Remove-Item -Path usbmmidd_v2\Win32 -Recurse
+          Remove-Item -Path "usbmmidd_v2\deviceinstaller64.exe", "usbmmidd_v2\deviceinstaller.exe", "usbmmidd_v2\usbmmidd.bat"
+          mv -Force .\usbmmidd_v2 ./rustdesk
+
+          # Download printer driver files and extract them to ./rustdesk
+          try {
+            Invoke-WebRequest -Uri https://github.com/rustdesk/hbb_common/releases/download/driver/rustdesk_printer_driver_v4-1.4.zip -OutFile rustdesk_printer_driver_v4-1.4.zip
+            Invoke-WebRequest -Uri https://github.com/rustdesk/hbb_common/releases/download/driver/printer_driver_adapter.zip -OutFile printer_driver_adapter.zip
+            Invoke-WebRequest -Uri https://github.com/rustdesk/hbb_common/releases/download/driver/sha256sums -OutFile sha256sums
+
+            # Check and move the files
+            $checksum_driver = (Select-String -Path .\sha256sums -Pattern '^([a-fA-F0-9]{64}) \*rustdesk_printer_driver_v4-1.4\.zip$').Matches.Groups[1].Value
+            $downloadsum_driver = Get-FileHash -Path rustdesk_printer_driver_v4-1.4.zip -Algorithm SHA256
+            $checksum_adapter = (Select-String -Path .\sha256sums -Pattern '^([a-fA-F0-9]{64}) \*printer_driver_adapter\.zip$').Matches.Groups[1].Value
+            $downloadsum_adapter = Get-FileHash -Path printer_driver_adapter.zip -Algorithm SHA256
+            if ($checksum_driver -eq $downloadsum_driver.Hash -and $checksum_adapter -eq $downloadsum_adapter.Hash) {
+                Write-Output "rustdesk_printer_driver_v4-1.4, checksums match, extract the file."
+                Expand-Archive rustdesk_printer_driver_v4-1.4.zip -DestinationPath .
+                mkdir ./rustdesk/drivers
+                mv -Force .\rustdesk_printer_driver_v4-1.4 ./rustdesk/drivers/RustDeskPrinterDriver
+                Expand-Archive printer_driver_adapter.zip -DestinationPath .
+                mv -Force .\printer_driver_adapter.dll ./rustdesk
+            } elseif ($checksum_driver -ne $downloadsum_driver.Hash) {
+                Write-Output "rustdesk_printer_driver_v4-1.4, checksums do not match, ignore the file."
+            } else {
+                Write-Output "printer_driver_adapter.dll, checksums do not match, ignore the file."
+            }
+          } catch {
+              Write-Host "Ingore the printer driver error."
+          }
+
+      - name: Download RustDeskTempTopMostWindow artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: topmostwindow-artifacts-x64
+          path: "./rustdesk"
+
+      - name: Rename the app executable
+        # The app installs and runs as <name>.exe; the launcher's extraction dir follows it.
+        shell: powershell
+        run: |
+          Move-Item ".\rustdesk\rustdesk.exe" ".\rustdesk\$env:APP_NAME.exe"
+          $reportedVersion = (& ".\rustdesk\$env:APP_NAME.exe" --version | Out-String).Trim()
+          if ($LASTEXITCODE -ne 0) {
+            throw "$env:APP_NAME --version exited with $LASTEXITCODE"
+          }
+          if ($reportedVersion -cne $env:VERSION) {
+            throw "$env:APP_NAME reports version '$reportedVersion', expected '$env:VERSION'"
+          }
+
+      - name: Build self-extracted executable
+        shell: bash
+        run: |
+          sed -i '/dpiAware/d' res/manifest.xml
+          pushd ./libs/portable
+          pip3 install -r requirements.txt
+          python3 ./generate.py -f ../../rustdesk/ -o . -e "../../rustdesk/${APP_NAME}.exe"
+          popd
+          mkdir -p ./SignOutput
+          mv ./target/release/rustdesk-portable-packer.exe "./SignOutput/${APP_LOWER}-${VERSION}-${ARCH}.exe"
+
+      - name: Upload Windows installer
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ env.APP_LOWER }}-windows-${{ env.ARCH }}
+          path: ./SignOutput/${{ env.APP_LOWER }}-${{ env.VERSION }}-${{ env.ARCH }}.exe
+          if-no-files-found: error
+
+      - name: Publish Release
+        uses: softprops/action-gh-release@de2c0eb89ae2a093876385947365aca7b0e5f844 # v1
+        with:
+          tag_name: ${{ env.TAG_NAME }}
+          target_commitish: ${{ github.sha }}
+          files: |
+            ./SignOutput/${{ env.APP_LOWER }}-*.exe
+
+  build-for-macOS:
+    name: ${{ matrix.job.target }}
+    runs-on: ${{ matrix.job.os }}
+    needs: [generate-bridge]
+    strategy:
+      fail-fast: false
+      matrix:
+        job:
+          - {
+              target: x86_64-apple-darwin,
+              os: macos-15-intel,
+              extra-build-args: "",
+              arch: x86_64,
+              vcpkg-triplet: x64-osx,
+            }
+          - {
+              target: aarch64-apple-darwin,
+              os: macos-15,
+              extra-build-args: "--screencapturekit",
+              arch: aarch64,
+              vcpkg-triplet: arm64-osx,
+            }
+    steps:
+      - name: Export GitHub Actions cache environment variables
+        uses: actions/github-script@d7906e4ad0b1822421a7e6a35d5ca353c962f410 # v6
+        with:
+          script: |
+            core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
+            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
+
+      - name: Checkout source code
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          submodules: recursive
+
+      - name: Apply brand
+        run: python3 brand/apply.py
+
+      - name: Install build runtime
+        run: |
+          brew install llvm create-dmg
+          # pkg-config is handled in a separate step, because it may be already installed by `macos-latest`(14.7.1) runner
+          if command -v pkg-config &>/dev/null; then
+              echo "pkg-config is already installed"
+          else
+              brew install pkg-config
+          fi
+
+      - name: Install NASM
+        run: |
+          # Install NASM 2.16.x from official release.
+          # Do NOT use `brew install nasm` which installs NASM 3.x.
+          # NASM 3.x is a complete rewrite with incompatible CLI options and removed features.
+          # aom and other multimedia libraries require NASM 2.x for x86/x86_64 assembly.
+          wget https://www.nasm.us/pub/nasm/releasebuilds/2.16.03/macosx/nasm-2.16.03-macosx.zip
+          unzip nasm-2.16.03-macosx.zip
+          sudo cp nasm-2.16.03/nasm /usr/local/bin/nasm
+          nasm --version
+
+      - name: Install flutter
+        uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2 # v2
+        with:
+          channel: "stable"
+          flutter-version: ${{ matrix.job.arch == 'aarch64' && env.FLUTTER_MACOS_ARM_VERSION || env.FLUTTER_VERSION }}
+
+      - name: Keep CocoaPods for Flutter 3.44 (arm64)
+        # 3.44 turns on Swift Package Manager by default, which would migrate Runner.xcodeproj and
+        # move some plugins off CocoaPods; every plugin still ships a podspec.
+        if: ${{ matrix.job.arch == 'aarch64' }}
+        run: flutter config --no-enable-swift-package-manager
+
+      - name: Patch flutter
+        # Flutter 3.44 (arm64) already has this dropdown fix.
+        if: ${{ matrix.job.arch == 'x86_64' }}
+        run: |
+          cd $(dirname $(dirname $(which flutter)))
+          if [[ "3.24.5" == ${{env.FLUTTER_VERSION}} ]]; then
+            git apply ${{ github.workspace }}/.github/patches/flutter_3.24.4_dropdown_menu_enableFilter.diff
+          fi
+
+      - name: Workaround for flutter issue
+        shell: bash
+        run: |
+          cd "$(dirname "$(which flutter)")"
+          # https://github.com/flutter/flutter/issues/133533
+          sed -i -e 's/_setFramesEnabledState(false);/\/\/_setFramesEnabledState(false);/g' ../packages/flutter/lib/src/scheduler/binding.dart
+          grep -n '_setFramesEnabledState(false);' ../packages/flutter/lib/src/scheduler/binding.dart
+
+      - name: Patch RustDesk sources for Flutter 3.44 (arm64)
+        # The script uses GNU `sed -i`, which macOS's BSD sed rejects.
+        if: ${{ matrix.job.arch == 'aarch64' }}
+        shell: bash
+        run: |
+          brew install gnu-sed
+          export PATH="$(brew --prefix gnu-sed)/libexec/gnubin:$PATH"
+          bash .github/patches/apply_flutter_3.44_source_patches.sh
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: ${{ env.MAC_RUST_VERSION }}
+          targets: ${{ matrix.job.target }}
+          components: "rustfmt"
+
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          prefix-key: ${{ matrix.job.os }}
+
+      - name: Restore bridge files
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          # arm64's *.freezed.dart must match the freezed it resolves under Flutter 3.44.
+          name: ${{ matrix.job.arch == 'aarch64' && 'bridge-artifact-flutter-3.44' || 'bridge-artifact' }}
+          path: ./
+
+      - name: Setup vcpkg with Github Actions binary cache
+        uses: lukka/run-vcpkg@b1a0dd252f06b9e25b3c022a9a03bd7a427fb6a2 # v11
+        with:
+          vcpkgGitCommitId: ${{ env.VCPKG_COMMIT_ID }}
+          doNotCache: false
+
+      - name: Install vcpkg dependencies
+        run: |
+          if ! $VCPKG_ROOT/vcpkg \
+            install \
+            --x-install-root="$VCPKG_ROOT/installed"; then
+            find "${VCPKG_ROOT}/" -name "*.log" | while read -r _1; do
+              echo "$_1:"
+              echo "======"
+              cat "$_1"
+              echo "======"
+              echo ""
+            done
+            exit 1
+          fi
+          head -n 100 "${VCPKG_ROOT}/buildtrees/ffmpeg/build-${{ matrix.job.vcpkg-triplet }}-rel-out.log" || true
+
+      - name: Build rustdesk
+        run: |
+          if [ "${{ matrix.job.target }}" = "aarch64-apple-darwin" ]; then
+            MIN_MACOS_VERSION="12.3"
+            sed -i -e "s/MACOSX_DEPLOYMENT_TARGET\=[0-9]*.[0-9]*/MACOSX_DEPLOYMENT_TARGET=${MIN_MACOS_VERSION}/" build.py
+            sed -i -e "s/platform :osx, '.*'/platform :osx, '${MIN_MACOS_VERSION}'/" flutter/macos/Podfile
+            sed -i -e "s/osx_minimum_system_version = \"[0-9]*.[0-9]*\"/osx_minimum_system_version = \"${MIN_MACOS_VERSION}\"/" Cargo.toml
+            sed -i -e "s/MACOSX_DEPLOYMENT_TARGET = [0-9]*.[0-9]*;/MACOSX_DEPLOYMENT_TARGET = ${MIN_MACOS_VERSION};/" flutter/macos/Runner.xcodeproj/project.pbxproj
+            echo "MACOSX_DEPLOYMENT_TARGET=${MIN_MACOS_VERSION}" >> "$GITHUB_ENV"
+          fi
+          ./build.py --flutter --hwcodec --unix-file-copy-paste ${{ matrix.job.extra-build-args }}
+
+      - name: Sign ad hoc and create dmg
+        env:
+          ARCH: ${{ matrix.job.arch }}
+        run: |
+          APP="./flutter/build/macos/Build/Products/Release/${APP_NAME}.app"
+          # build.py adds the service binary after Xcode signed the bundle; seal it again.
+          bash ./.github/scripts/sign-macos-app.sh "$APP" - ./flutter/macos/Runner/Release.entitlements
+          reported_version="$("$APP/Contents/MacOS/${APP_NAME}" --version)"
+          if [ "$reported_version" != "$VERSION" ]; then
+            echo "::error::${APP_NAME} reports version '$reported_version', expected '$VERSION'"
+            exit 1
+          fi
+          CREATE_DMG="$(command -v create-dmg)"
+          CREATE_DMG="$(readlink -f "$CREATE_DMG")"
+          sed -i -e 's/MAXIMUM_UNMOUNTING_ATTEMPTS=3/MAXIMUM_UNMOUNTING_ATTEMPTS=7/' "$CREATE_DMG"
+          create-dmg --volname "${APP_NAME}" --icon "${APP_NAME}.app" 200 190 --hide-extension "${APP_NAME}.app" --window-size 800 400 --app-drop-link 600 185 "${APP_LOWER}-${VERSION}-${ARCH}.dmg" "$APP"
+
+      - name: Upload macOS dmg
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ env.APP_LOWER }}-macos-${{ matrix.job.arch }}
+          path: ${{ env.APP_LOWER }}-${{ env.VERSION }}-${{ matrix.job.arch }}.dmg
+          if-no-files-found: error
+
+      - name: Publish Release
+        uses: softprops/action-gh-release@de2c0eb89ae2a093876385947365aca7b0e5f844 # v1
+        with:
+          tag_name: ${{ env.TAG_NAME }}
+          target_commitish: ${{ github.sha }}
+          files: |
+            ${{ env.APP_LOWER }}-*-${{ matrix.job.arch }}.dmg
