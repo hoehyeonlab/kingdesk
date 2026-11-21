@@ -13,6 +13,11 @@ on:
         description: "Release tag the installers are published under"
         type: string
         default: "kingdesk-1.5.3"
+      platforms:
+        description: "Which installers to build"
+        type: choice
+        options: [all, windows, macos]
+        default: all
 
 permissions:
   contents: write
@@ -37,6 +42,7 @@ jobs:
     uses: ./.github/workflows/bridge.yml
 
   build-RustDeskTempTopMostWindow:
+    if: ${{ inputs.platforms != 'macos' }}
     uses: ./.github/workflows/third-party-RustDeskTempTopMostWindow.yml
     with:
       upload-artifact: true
@@ -46,6 +52,7 @@ jobs:
       target_version: Windows10
 
   build-for-windows:
+    if: ${{ inputs.platforms != 'macos' }}
     name: x86_64-pc-windows-msvc
     needs: [build-RustDeskTempTopMostWindow, generate-bridge]
     runs-on: windows-2022
@@ -229,6 +236,7 @@ jobs:
             ./SignOutput/${{ env.APP_LOWER }}-*.exe
 
   build-for-macOS:
+    if: ${{ inputs.platforms != 'windows' }}
     name: ${{ matrix.job.target }}
     runs-on: ${{ matrix.job.os }}
     needs: [generate-bridge]
@@ -383,7 +391,15 @@ jobs:
         run: |
           APP="./flutter/build/macos/Build/Products/Release/${APP_NAME}.app"
           # build.py adds the service binary after Xcode signed the bundle; seal it again.
-          bash ./.github/scripts/sign-macos-app.sh "$APP" - ./flutter/macos/Runner/Release.entitlements
+          # Ad hoc and without the hardened runtime: under it, library validation rejects the
+          # bundle's own ad hoc frameworks ("different Team IDs") and the app dies at launch on
+          # any Mac but the build machine, which is why upstream's sign-macos-app.sh is not used.
+          codesign --force --deep --sign - "$APP"
+          codesign --verify --deep --strict --verbose=2 "$APP"
+          if codesign -dv "$APP" 2>&1 | grep -E '^CodeDirectory' | grep -q runtime; then
+            echo "::error::ad hoc signature must not enable the hardened runtime"
+            exit 1
+          fi
           reported_version="$("$APP/Contents/MacOS/${APP_NAME}" --version)"
           if [ "$reported_version" != "$VERSION" ]; then
             echo "::error::${APP_NAME} reports version '$reported_version', expected '$VERSION'"
